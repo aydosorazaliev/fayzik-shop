@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fayzik FF Shop: sahifani beradi va akkauntlar ro'yxatini products.json da saqlaydi."""
 import os, json, hmac, hashlib, time, threading
+import urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -10,6 +11,86 @@ SECRET = hashlib.sha256(("fz|" + PASSWORD).encode()).digest()
 LOCK = threading.Lock()
 GROUPS = {"cheap", "mid", "premium"}
 TOKEN_TTL = 12 * 3600
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+USE_DB = bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def sb(method, path, body=None, prefer=None):
+    """Supabase REST (PostgREST) so'rovi. Faqat serverda, service_role kaliti bilan."""
+    headers = {"apikey": SUPABASE_KEY, "Authorization": "Bearer " + SUPABASE_KEY,
+               "Content-Type": "application/json"}
+    if prefer:
+        headers["Prefer"] = prefer
+    data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+    req = urllib.request.Request(SUPABASE_URL + "/rest/v1/" + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read().decode("utf-8")
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "ignore")[:300]
+        raise RuntimeError(f"Supabase xato {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError("Supabase bilan aloqa yo'q") from exc
+
+
+def to_row(p):
+    r = dict(p)
+    r["grp"] = r.pop("group", "cheap")
+    return r
+
+
+def from_row(r):
+    p = {k: v for k, v in r.items() if k not in ("grp", "updated_at")}
+    p["group"] = r.get("grp", "cheap")
+    return p
+
+
+def verify_telegram_init_data(init_data):
+    """Validate Telegram Mini App initData before trusting its user details."""
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        from urllib.parse import parse_qsl
+        fields = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = fields.pop("hash", "")
+        if not received_hash:
+            return None
+        check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated, received_hash):
+            return None
+        auth_date = int(fields.get("auth_date", "0"))
+        if auth_date <= 0 or time.time() - auth_date > 86400:
+            return None
+        user = json.loads(fields.get("user", "{}"))
+        return user if isinstance(user, dict) else None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def telegram_send_message(text):
+    if not BOT_TOKEN or not ADMIN_CHAT_ID:
+        raise RuntimeError("Render Environment'da BOT_TOKEN va ADMIN_CHAT_ID sozlanmagan.")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = json.dumps({
+        "chat_id": ADMIN_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True
+    }).encode()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Telegram'ga xabar yuborilmadi. Bot tokeni va chat ID ni tekshiring.") from exc
+    if not result.get("ok"):
+        raise RuntimeError("Telegram API xabarni qabul qilmadi. Bot admin chatda /start qilinganini tekshiring.")
+    return result
 
 DEFAULTS = [
     {"id": 1, "emoji": "🎮", "group": "cheap", "price": 150000, "level": 72, "skins": 12, "sold": False, "img": "",
@@ -72,6 +153,9 @@ def clean(items):
 
 
 def load():
+    if USE_DB:
+        rows = sb("GET", "products?select=*&order=id.asc")
+        return [from_row(r) for r in rows or []]
     with LOCK:
         try:
             with open(DATA_FILE, encoding="utf-8") as f:
@@ -81,12 +165,33 @@ def load():
 
 
 def save(items):
+    if USE_DB:
+        with LOCK:
+            if items:
+                sb("POST", "products?on_conflict=id", [to_row(i) for i in items],
+                   prefer="resolution=merge-duplicates,return=minimal")
+                ids = ",".join(str(i["id"]) for i in items)
+                sb("DELETE", f"products?id=not.in.({ids})", prefer="return=minimal")
+            else:
+                sb("DELETE", "products?id=gte.0", prefer="return=minimal")
+        return
     with LOCK:
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=1)
         os.replace(tmp, DATA_FILE)
+
+
+def save_order(name, username, customer_id, lines, total):
+    """Buyurtmani bazaga yozadi. Xato bo'lsa ham buyurtma Telegram'ga baribir yuboriladi."""
+    if not USE_DB:
+        return
+    try:
+        sb("POST", "orders", {"customer_name": name, "username": username, "telegram_id": customer_id,
+                              "items": lines, "total": total}, prefer="return=minimal")
+    except RuntimeError as exc:
+        print("Buyurtmani saqlab bo'lmadi:", exc)
 
 
 def sign(exp):
@@ -136,7 +241,10 @@ class H(BaseHTTPRequestHandler):
             with open(os.path.join(BASE, "index.html"), "rb") as f:
                 return self.send(200, f.read(), "text/html; charset=utf-8")
         if p == "/api/products":
-            return self.send(200, {"products": load()})
+            try:
+                return self.send(200, {"products": load()})
+            except RuntimeError as exc:
+                return self.send(502, {"error": str(exc)})
         if p == "/healthz":
             return self.send(200, b"ok", "text/plain")
         self.send(404, {"error": "not found"})
@@ -144,7 +252,10 @@ class H(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/api/login":
+        path = self.path.split("?")[0]
+        if path == "/api/order":
+            return self.create_order()
+        if path != "/api/login":
             return self.send(404, {"error": "not found"})
         if not PASSWORD:
             return self.send(503, {"error": "ADMIN_PASSWORD o‘rnatilmagan (Render → Environment)"})
@@ -153,6 +264,69 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"token": make_token()})
         time.sleep(1)
         self.send(401, {"error": "Parol noto‘g‘ri"})
+
+    def create_order(self):
+        if not BOT_TOKEN or not ADMIN_CHAT_ID:
+            return self.send(503, {"error": "Buyurtma bot sozlanmagan. Render Environment'da BOT_TOKEN va ADMIN_CHAT_ID kerak."})
+        data = self.body()
+        raw_items = data.get("items")
+        if not isinstance(raw_items, list) or not raw_items or len(raw_items) > 30:
+            return self.send(400, {"error": "Savat bo‘sh yoki buyurtma ma’lumoti noto‘g‘ri."})
+
+        try:
+            catalog = load()
+        except RuntimeError as exc:
+            return self.send(502, {"error": str(exc)})
+        products = {int(p["id"]): p for p in catalog if isinstance(p, dict) and str(p.get("id", "")).isdigit()}
+        lines, total = [], 0
+        for entry in raw_items:
+            if not isinstance(entry, dict):
+                continue
+            pid = num(entry.get("id"), 0, 10**9)
+            qty = num(entry.get("qty"), 0, 20)
+            product = products.get(pid)
+            if not product or product.get("sold") or qty < 1:
+                return self.send(400, {"error": "Savatdagi mahsulot sotilgan yoki mavjud emas. Sahifani yangilang."})
+            price = num(product.get("price"))
+            subtotal = price * qty
+            total += subtotal
+            title = txt(product.get("name_uz") or product.get("name_ru"), 120)
+            lines.append(f"• {title} × {qty} — {subtotal:,} so‘m".replace(",", " "))
+
+        if not lines:
+            return self.send(400, {"error": "Buyurtmada mahsulot topilmadi."})
+
+        name = txt(data.get("name"), 80) or "Ko‘rsatilmagan"
+        username = txt(data.get("username"), 80)
+        if username and not username.startswith("@"):
+            username = "@" + username
+        tg_user = verify_telegram_init_data(txt(data.get("initData"), 5000))
+        if tg_user:
+            first = txt(tg_user.get("first_name"), 80)
+            last = txt(tg_user.get("last_name"), 80)
+            full = (first + " " + last).strip()
+            if full:
+                name = full
+            if tg_user.get("username"):
+                username = "@" + txt(tg_user.get("username"), 80)
+            customer_id = str(tg_user.get("id", ""))
+        else:
+            customer_id = ""
+
+        message = (
+            "🛒 YANGI BUYURTMA — FAYZIK FF SHOP\n\n"
+            + "\n".join(lines)
+            + f"\n\n💰 JAMI: {total:,} so‘m".replace(",", " ")
+            + f"\n👤 Xaridor: {name}"
+            + f"\n📨 Username: {username or 'Ko‘rsatilmagan'}"
+            + (f"\n🆔 Telegram ID: {customer_id}" if customer_id else "")
+        )
+        save_order(name, username, customer_id, lines, total)
+        try:
+            telegram_send_message(message)
+        except RuntimeError as exc:
+            return self.send(502, {"error": str(exc)})
+        return self.send(200, {"ok": True, "message": "Buyurtmangiz adminga yuborildi!"})
 
     def do_PUT(self):
         if self.path.split("?")[0] != "/api/products":
@@ -164,12 +338,23 @@ class H(BaseHTTPRequestHandler):
         if not isinstance(items, list):
             return self.send(400, {"error": "noto‘g‘ri ma’lumot"})
         items = clean(items)
-        save(items)
+        try:
+            save(items)
+        except RuntimeError as exc:
+            return self.send(502, {"error": str(exc)})
         self.send(200, {"products": items})
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    if USE_DB:
+        try:
+            if not sb("GET", "products?select=id&limit=1"):
+                save(clean(DEFAULTS))  # birinchi ishga tushishda namunaviy akkauntlar
+        except RuntimeError as exc:
+            print("DIQQAT: Supabase'ga ulanib bo'lmadi:", exc)
+    else:
+        print("DIQQAT: SUPABASE_URL/SUPABASE_SERVICE_KEY yo'q, products.json ishlatiladi (Render'da o'chib ketadi).")
     if not PASSWORD:
         print("DIQQAT: ADMIN_PASSWORD o'rnatilmagan, admin panel ishlamaydi.")
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
